@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/smtp"
 	"net/textproto"
+	"slices"
 	"strings"
 
 	"github.com/goposta/posta/internal/models"
@@ -92,11 +93,56 @@ func (s *SMTPSender) TestConnection(server *models.SMTPServer) error {
 	defer func() { _ = client.Close() }()
 
 	if server.Username != "" {
-		if err := client.Auth(smtp.PlainAuth("", server.Username, server.Password, server.Host)); err != nil {
+		if err := client.Auth(newAuth(server.Host, server.Username, server.Password)); err != nil {
 			return fmt.Errorf("SMTP auth failed: %w", err)
 		}
 	}
 	return client.Quit()
+}
+
+// autoAuth uses PLAIN when the server offers it, otherwise LOGIN (Exchange Online).
+type autoAuth struct {
+	plain            smtp.Auth
+	host, user, pass string
+	login            bool
+}
+
+func newAuth(host, username, password string) smtp.Auth {
+	return &autoAuth{plain: smtp.PlainAuth("", username, password, host), host: host, user: username, pass: password}
+}
+
+func (a *autoAuth) Start(server *smtp.ServerInfo) (string, []byte, error) {
+	if !offers(server.Auth, "LOGIN") || offers(server.Auth, "PLAIN") {
+		return a.plain.Start(server)
+	}
+	if !server.TLS && server.Name != "localhost" && server.Name != "127.0.0.1" && server.Name != "::1" {
+		return "", nil, errors.New("unencrypted connection")
+	}
+	if server.Name != a.host {
+		return "", nil, errors.New("wrong host name")
+	}
+	a.login = true
+	return "LOGIN", nil, nil
+}
+
+func (a *autoAuth) Next(fromServer []byte, more bool) ([]byte, error) {
+	if !a.login {
+		return a.plain.Next(fromServer, more)
+	}
+	if !more {
+		return nil, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(string(fromServer))) {
+	case "username:":
+		return []byte(a.user), nil
+	case "password:":
+		return []byte(a.pass), nil
+	}
+	return nil, fmt.Errorf("unexpected LOGIN challenge %q", fromServer)
+}
+
+func offers(mechanisms []string, name string) bool {
+	return slices.ContainsFunc(mechanisms, func(m string) bool { return strings.EqualFold(m, name) })
 }
 
 func (s *SMTPSender) Send(server *models.SMTPServer, from string, to []string, subject, htmlBody, textBody string, attachments []models.Attachment, headers map[string]string, listUnsubscribeURL, listUnsubscribeMailto string, listUnsubscribePost bool) error {
@@ -104,7 +150,7 @@ func (s *SMTPSender) Send(server *models.SMTPServer, from string, to []string, s
 
 	var auth smtp.Auth
 	if server.Username != "" {
-		auth = smtp.PlainAuth("", server.Username, server.Password, server.Host)
+		auth = newAuth(server.Host, server.Username, server.Password)
 	}
 
 	msg := buildMessage(from, to, subject, htmlBody, textBody, attachments, headers, listUnsubscribeURL, listUnsubscribeMailto, listUnsubscribePost)
