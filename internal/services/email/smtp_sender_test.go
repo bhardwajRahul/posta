@@ -6,6 +6,7 @@ package email
 import (
 	"errors"
 	"fmt"
+	"net/smtp"
 	"net/textproto"
 	"testing"
 )
@@ -68,5 +69,45 @@ func TestWrapSendError(t *testing.T) {
 	// Error string must be preserved unchanged for storage/logging.
 	if se.Error() != orig.Error() {
 		t.Fatalf("Error() = %q, want %q", se.Error(), orig.Error())
+	}
+}
+
+func TestAuthPrefersPlainWhenOffered(t *testing.T) {
+	a := newAuth("mail.example.com", "user", "secret")
+	mech, _, err := a.Start(&smtp.ServerInfo{Name: "mail.example.com", TLS: true, Auth: []string{"LOGIN", "PLAIN"}})
+	if err != nil || mech != "PLAIN" {
+		t.Fatalf("mech=%q err=%v, want PLAIN", mech, err)
+	}
+}
+
+func TestAuthFallsBackToPlainWhenNothingAdvertised(t *testing.T) {
+	a := newAuth("mail.example.com", "user", "secret")
+	mech, _, err := a.Start(&smtp.ServerInfo{Name: "mail.example.com", TLS: true})
+	if err != nil || mech != "PLAIN" {
+		t.Fatalf("mech=%q err=%v, want PLAIN", mech, err)
+	}
+}
+
+func TestAuthUsesLoginWhenPlainNotOffered(t *testing.T) {
+	a := newAuth("smtp.office365.com", "user", "secret")
+	mech, _, err := a.Start(&smtp.ServerInfo{Name: "smtp.office365.com", TLS: true, Auth: []string{"LOGIN", "XOAUTH2"}})
+	if err != nil || mech != "LOGIN" {
+		t.Fatalf("mech=%q err=%v, want LOGIN", mech, err)
+	}
+	if got, _ := a.Next([]byte("Username:"), true); string(got) != "user" {
+		t.Fatalf("username challenge answered with %q", got)
+	}
+	if got, _ := a.Next([]byte("Password:"), true); string(got) != "secret" {
+		t.Fatalf("password challenge answered with %q", got)
+	}
+	if _, err := a.Next([]byte("Nonce:"), true); err == nil {
+		t.Fatal("unexpected challenge must fail")
+	}
+}
+
+func TestAuthLoginRefusesUnencryptedConnection(t *testing.T) {
+	a := newAuth("smtp.office365.com", "user", "secret")
+	if _, _, err := a.Start(&smtp.ServerInfo{Name: "smtp.office365.com", Auth: []string{"LOGIN"}}); err == nil {
+		t.Fatal("LOGIN over plaintext must be refused")
 	}
 }
